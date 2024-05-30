@@ -1,0 +1,215 @@
+---
+title: "NYPD Shooting Data"
+output:
+  html_document: default
+  pdf_document: default
+date: "2024-05-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## NYPD Shooting Data
+
+This is an analysis of NYPD shooting data from 2006 through the end of 2023. We will go through the steps of the data science process and create two visualizations and a model.
+
+### Step 1: Import the Data and Enable Libraries
+
+Let's first take the time to enable the various libraries we will use:
+
+```{r enable_libraries, message = FALSE}
+library(lubridate)        # Functions to work with dates and time stamps
+library(tidyverse)        # Import all the tidyverse packages (here we use ggplot2, dplyr, and tidyr)
+library(leaflet)          # Create interactive web maps
+library(utils)            # R utility functions
+library(Matrix)           # Sparse and dense matrix functions
+library(arules)           # Analyze transactional data (we will use this package to implement the apriori model)
+library(forecast)         # package for time series forecasting
+library(base)             # The base R package
+```
+
+The data we are importing is data of all shootings responded to by the NYPD between 2006 and 2023. The dataset includes key information about each shooting, including age/race/gender of each victim and each perpetrator, location of the incident, the date and time of each incident, and other data that is not of concern to us at this time.
+
+We are sourcing data from the following URL:
+
+<https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv>
+
+We will import the data directly from this URL:
+
+```{r import_data, message = FALSE}
+nypd <- read.csv("https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv")
+head(nypd)
+```
+
+### Step 2: Tidy the Data
+
+Now that our data is loaded, we can clean it. We don't need all 21 variables present in the dataset, so we will delete the columns we don't need.
+
+The unnecessary columns we are removing are as follows:
+
+-   INCIDENT_KEY (Column 1)
+-   LOC_OF_OCCUR_DESC (Column 5)
+-   JURISDICTION_CODE (Column 7)
+-   LOC_CLASSFCTN_DESC (Column 8)
+-   X_COORD_CD (Column 17)
+-   Y_COORD_CD (Column 18)
+-   Lon_Lat (Column 21)
+
+Let's remove these columns from our dataset:
+
+```{r remove_columns, message = FALSE}
+columns_to_remove <- c(1, 5, 7, 8, 17, 18, 21)
+nypd_clean <- nypd[, -columns_to_remove]
+```
+
+There are some columns in the CSV that use empty cells and null strings "(null)" interchangeably. We will remove all the null strings and replace them with empty cells for consistency:
+
+```{r remove_null_strings, message = FALSE}
+nypd_clean[] <- lapply(nypd_clean, function(x) gsub("\\(null\\)", "", x))
+```
+
+All the data types are originally strings. Let's convert them to usable data types. We will convert the following columns:
+
+-   Latitude: character -\> numeric
+-   Longitude: character -\> numeric
+-   OCCUR_DATE: character -\> Date
+-   OCCUR_TIME: character -\> Period
+-   STATISTICAL_MURDER_FLAG: character -\> logical
+
+We will be using the Latitude and Longitude columns. Some of these values are not numerical, so we will convert them to numerical values:
+
+```{r convert_data_types, message = FALSE}
+nypd_clean$Latitude <- as.numeric(nypd_clean$Latitude)
+nypd_clean$Longitude <- as.numeric(nypd_clean$Longitude)
+
+nypd_clean$OCCUR_DATE <- mdy(nypd_clean$OCCUR_DATE)
+nypd_clean$OCCUR_TIME <- hms(nypd_clean$OCCUR_TIME)
+
+nypd_clean$STATISTICAL_MURDER_FLAG <- as.logical(nypd_clean$STATISTICAL_MURDER_FLAG)
+```
+
+### Step 3: Transform the Data
+
+Now that our data is cleaned, we can look for ways to transform it. We can combine the OCCUR_DATE and OCCUR_TIME columns into one DATETIME column that we will use for analysis later:
+
+```{r create_datetime_column, message = FALSE, results='hide'}
+nypd_clean  %>% drop_na(OCCUR_DATE)
+nypd_clean  %>% drop_na(OCCUR_TIME)
+
+nypd_clean$DATETIME <- as_datetime(nypd_clean$OCCUR_DATE + nypd_clean$OCCUR_TIME)
+```
+
+### Step 4: Visualize the Data
+
+Let's visualize the data.
+
+#### Visualization 1: Shootings by Borough
+
+One of the features we find in the data set is the New York City borough in which the shooting occurred. I would like to know which borough has experienced the most shootings and how each compares to one another.
+
+First, get the count of shootings for each borough and the percentage of total shootings that each borough accounts for:
+
+```{r count_shootings_by_boro, message = FALSE}
+borough_counts <- nypd_clean %>% count(BORO)
+borough_counts <- borough_counts[order(-borough_counts$n), ]
+
+total_shootings <- sum(borough_counts$n)
+borough_counts <- mutate(borough_counts, percentage = n/total_shootings * 100)
+```
+
+Now, let's set a custom color pallete and generate our chart:
+
+```{r generate_chart, message = FALSE}
+custom_colors <- c("MANHATTAN" = "#f97b57",
+                   "BROOKLYN" = "#f7945d",
+                   "QUEENS" = "#f3ad6a",
+                   "BRONX" = "#efc47e",
+                   "STATEN ISLAND" = "#ecda9a")
+
+
+ggplot(borough_counts, aes(x = "", y = n, fill = BORO)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  theme_void() +
+  geom_text(aes(x=1.2, label = paste0(BORO, ": ", n, "\n(", round(percentage, 1), "%)")), position = position_stack(vjust = 0.5)) +
+  labs(title = "Shootings Per Borough", fill = "Borough")+
+  scale_fill_manual(values = custom_colors)
+```
+
+##### Communicate the Data
+
+Now we have a pie chart that shows the amount of shootings by borough and the percentage of all New York City shootings each borough accounts for. This data could be used to make recommendations about where a larger police presence is needed or where more community safety programs could be put in place.
+
+#### Visualization 2: Location of each shooting
+
+We have coordinates for each shooting that is in the data set. Let's create a map of where each shooting took place to see if there are any trends. We will use the leaflet package to plot the coordinates over a map that we can zoom in and out of.
+
+```{r create_map, message = FALSE}
+leaflet() %>% addTiles() %>% 
+  addCircleMarkers(data = nypd_clean,
+                   lat = ~Latitude, lng = ~Longitude,
+                   color = "red",
+                   radius = 0.05)
+```
+
+##### Communicate the Data
+
+Here, we can see where each shooting took place. We can see that there are higher concentrations of shootings in certain areas of the city, while other areas are much more spread out. This data could be useful for people who are determining where they want to live in the city.
+
+### Step 5: Model the Data
+
+Let's perform association rule mining to see if there is a relationship between the time of a shooting and the precinct it happens in. In layman's terms, the question is as follows: If there is a shooting in {Precinct X}, then it is likely to happen at {this time of day}."
+
+The first step is to discretize our data. Let's do this by dividing hours of the day into the time slots Morning, Afternoon, Evening, and Night and saving this data to a new column.
+
+```{r discretize_datetime, message = FALSE}
+morning_start <- as.POSIXct("05:00:00", format = "%H:%M:%S")
+afternoon_start <- as.POSIXct("12:00:00", format = "%H:%M:%S")
+evening_start <- as.POSIXct("16:00:00", format = "%H:%M:%S")
+night_start <- as.POSIXct("21:00:00", format = "%H:%M:%S")
+night_end <- as.POSIXct("04:59:59", format = "%H:%M:%S")
+
+
+nypd_clean$hour <- format(nypd_clean$DATETIME, "%H")
+nypd_clean$hour <- as.numeric(nypd_clean$hour)
+
+nypd_clean$TIME_SLOT <- ifelse(nypd_clean$hour >= 21 | nypd_clean$hour < 5, "Night",
+                               ifelse(nypd_clean$hour >= 5 & nypd_clean$hour < 12, "Morning",
+                                      ifelse(nypd_clean$hour >= 12 & nypd_clean$hour < 16, "Afternoon", "Evening")))
+```
+
+Next, let's create the apriori model, a model that will help us associate categorical variables to one another.
+
+```{r apriori_model, message = FALSE}
+nypd_subset <- nypd_clean[, c("TIME_SLOT", "PRECINCT")]
+nypd_subset$TIME_SLOT <- factor(nypd_subset$TIME_SLOT)
+nypd_subset$PRECINCT <- factor(nypd_subset$PRECINCT)
+
+nypd_transactions <- as(nypd_subset, "transactions")
+
+rules <- apriori(nypd_transactions, parameter = list(support = 0.001, confidence = 0.5, maxlen = 2))
+inspect(sort(rules, by = "lift"))
+```
+
+##### Communicate the Data
+
+When we inspect the results of the model, we can learn the following. Take the first line for example:
+
+-   {PRECINCT=10} =\> {TIME_SLOT=Night} 0.001960647 0.7567568 0.002590855 1.3362897 56
+
+This rule indicates that if an incident occurs in Precinct 10, there's a high likelihood (confidence of 0.757) that it will happen during the Night (TIME_SLOT=Night). The lift value of 1.336 suggests that this association is 1.336 times more likely to occur than if the antecedent and consequent were independent.
+
+You can interpret other rules in a similar manner. Each rule provides insight into the association between precincts and time slots.
+
+This data could be useful in predicting what times of day that a shooting is most likely to occur in each precinct. Each precinct could have a better idea of how to deploy their emergency responders and how to staff firehouses and police stations to be ready for when a shooting would most likely occur in that area.
+
+### Conclusion
+
+##### General Thoughts
+
+Data as simple as New York City shootings can provide a trove of information that can be used to better society and prevent tragedies from occurring. Predicting where and when a shooting is most likely to occur can help law enforcement and other first responders be in the right place at the right time to treat shooting injuries or prevent shootings from happening in the first place. This data can be used to make the city a safer place in the future.
+
+##### Bias
+
+There are lots of ways for bias to creep into this data. The data itself is each shooting that the NYPD responds to, so the data itself isn't necessarily biased. However, the data contains demographic information including race and gender. It can be easy to skew analysis in favor of showing that certain races or genders are more responsible for shootings or are disproportionately affected as victims of shootings. Using the data to fit your narrative can be used for racist purposes, which is never okay. I made sure to leave age, race, and gender out of my analysis to be sure I didn't paint anybody in the wrong light.
